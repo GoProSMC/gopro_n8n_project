@@ -1,0 +1,142 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+  <meta charset="UTF-8">
+  <title>n8n Analyzer Form</title>
+  <style>
+    body { font-family: "Segoe UI", sans-serif; max-width: 520px; margin: 40px auto; padding: 16px; }
+    label { display: block; margin: 12px 0 4px; font-weight: 600; }
+    input, select, textarea, button { width: 100%; padding: 10px; font-size: 14px; box-sizing: border-box; }
+    button { margin-top: 16px; background: #111827; color: #fff; border: none; cursor: pointer; }
+    button:disabled { opacity: 0.5; cursor: not-allowed; }
+    .hint { color: #6b7280; font-size: 12px; margin-top: 4px; }
+    .status { margin-top: 16px; font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace; white-space: pre-wrap; background: #f9fafb; padding: 12px; border: 1px solid #e5e7eb; }
+  </style>
+</head>
+<body>
+  <h1>주식 분석 요청</h1>
+  <form id="analyze-form">
+    <label for="endpoint">n8n Webhook URL</label>
+    <input id="endpoint" name="endpoint" type="url" value="http://localhost:5678/webhook/analyze" required>
+    <div class="hint">예: http://localhost:5678/webhook/analyze</div>
+
+    <label for="query">종목/회사명</label>
+    <input id="query" name="query" placeholder="삼성전자 또는 AAPL.US" required>
+
+    <label for="lookback">Lookback (일수)</label>
+    <input id="lookback" name="lookback" type="number" value="60" min="1">
+
+    <label for="model">Gemini 모델</label>
+    <input id="model" name="model" value="models/gemini-2.5-flash">
+
+    <button type="submit">분석 요청</button>
+  </form>
+
+  <div id="status" class="status" aria-live="polite"></div>
+
+  <div style="margin-top:16px;">
+    <a id="open-prices" href="../data/prices.xlsx" target="_blank" style="display:inline-block;margin-right:8px;">prices.xlsx 열기</a>
+    <a id="open-signals" href="../data/signals.xlsx" target="_blank" style="display:inline-block;">signals.xlsx 열기</a>
+    <div class="hint">폼 전송 후 위 링크로 엑셀 파일을 바로 열 수 있습니다.</div>
+  </div>
+
+  <div style="margin-top:16px;">
+    <button type="button" id="refresh-signals" style="width:auto;padding:8px 12px;">signals.xlsx 화면에 보기</button>
+  </div>
+
+  <div id="table-container" style="margin-top:12px; overflow:auto; max-height:380px; border:1px solid #e5e7eb; padding:8px; display:none;">
+    <table id="signals-table" style="width:100%; border-collapse: collapse; font-size:13px;">
+      <thead></thead>
+      <tbody></tbody>
+    </table>
+  </div>
+
+  <script>
+    // SheetJS from CDN to render XLSX in-page
+    const sheetJsUrl = "https://cdn.jsdelivr.net/npm/xlsx/dist/xlsx.full.min.js";
+    const loadSheetJs = () => new Promise((resolve, reject) => {
+      if (window.XLSX) return resolve();
+      const s = document.createElement('script');
+      s.src = sheetJsUrl;
+      s.onload = resolve;
+      s.onerror = reject;
+      document.head.appendChild(s);
+    });
+
+    const form = document.getElementById('analyze-form');
+    const statusEl = document.getElementById('status');
+    const refreshBtn = document.getElementById('refresh-signals');
+    const tableContainer = document.getElementById('table-container');
+    const tableHead = document.querySelector('#signals-table thead');
+    const tableBody = document.querySelector('#signals-table tbody');
+
+    const renderStatus = (msg) => { statusEl.textContent = msg; };
+
+    async function renderSignalsTable() {
+      try {
+        await loadSheetJs();
+        renderStatus('signals.xlsx 불러오는 중...');
+        const resp = await fetch('../data/signals.xlsx', { cache: 'no-store' });
+        if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
+        const buf = await resp.arrayBuffer();
+        const wb = XLSX.read(new Uint8Array(buf), { type: 'array' });
+        const sheet = wb.Sheets[wb.SheetNames[0]];
+        const rows = XLSX.utils.sheet_to_json(sheet, { defval: '' });
+        if (!rows.length) {
+          tableContainer.style.display = 'none';
+          renderStatus('signals.xlsx: 데이터 없음');
+          return;
+        }
+        const cols = Object.keys(rows[0]);
+        tableHead.innerHTML = '<tr>' + cols.map(c => `<th style="border:1px solid #e5e7eb;padding:6px;text-align:left;background:#f3f4f6;">${c}</th>`).join('') + '</tr>';
+        tableBody.innerHTML = rows.map(r => '<tr>' + cols.map(c => `<td style="border:1px solid #e5e7eb;padding:6px;">${r[c]}</td>`).join('') + '</tr>').join('');
+        tableContainer.style.display = 'block';
+        renderStatus('signals.xlsx 로드 완료');
+      } catch (err) {
+        tableContainer.style.display = 'none';
+        renderStatus(`signals.xlsx 로드 실패: ${err}`);
+      }
+    }
+
+    form.addEventListener('submit', async (e) => {
+      e.preventDefault();
+      const endpoint = document.getElementById('endpoint').value.trim();
+      const query = document.getElementById('query').value.trim();
+      const lookback = Number(document.getElementById('lookback').value || 60);
+      const model = document.getElementById('model').value.trim() || 'models/gemini-2.5-flash';
+
+      if (!endpoint || !query) {
+        renderStatus('endpoint와 query는 필수입니다.');
+        return;
+      }
+
+      const payload = { query, lookback, model };
+      renderStatus('요청 중...');
+      const btn = form.querySelector('button[type="submit"]');
+      btn.disabled = true;
+
+      try {
+        const resp = await fetch(endpoint, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(payload),
+        });
+        const text = await resp.text();
+        renderStatus(`HTTP ${resp.status}\n${text}`);
+        if (resp.ok) {
+          // 성공 시 페이지 안에서 signals.xlsx를 바로 렌더링
+          renderSignalsTable();
+        }
+      } catch (err) {
+        renderStatus(`에러: ${err}`);
+      } finally {
+        btn.disabled = false;
+      }
+    });
+
+    refreshBtn.addEventListener('click', () => {
+      renderSignalsTable();
+    });
+  </script>
+</body>
+</html>
